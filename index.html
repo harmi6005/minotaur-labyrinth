@@ -1,0 +1,1720 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<title>미노타우르스의 미궁 3 - 테스트 웹버전</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #0a0705;
+    /* 더블탭 확대와 핀치 줌만 막고, 한 손가락 스크롤(시작 화면의 입구 목록 넘기기)은
+       그대로 허용한다. 실제 플레이 화면의 고정 높이는 게임 컴포넌트 자체의
+       .ml-page-playing 클래스가 담당한다. (주의: 이 규칙을 모든 요소에 * 로 걸면
+       일부 안드로이드 브라우저에서 스크롤 자체가 막히는 버그가 있어 html/body에만 적용) */
+    touch-action: manipulation;
+    overscroll-behavior-y: contain;
+    -webkit-tap-highlight-color: transparent;
+  }
+</style>
+
+<!-- 브라우저에서 그대로 실행하기 위한 모듈 매핑: react / react-dom / lucide-react 를
+     CDN(esm.sh)에서 불러온다. lucide-react 는 react 를 별도 번들링하지 않도록
+     external 옵션을 줘서 하나의 react 인스턴스만 쓰도록 강제한다(훅 충돌 방지). -->
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.3.1",
+    "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
+    "lucide-react": "https://esm.sh/lucide-react@0.383.0?external=react,react-dom"
+  }
+}
+</script>
+
+<!-- 브라우저에서 JSX 문법을 실시간으로 변환해주는 Babel Standalone -->
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+  // Claude 아티팩트 전용 API인 window.storage 를 이 페이지 밖에서도 그대로 동작하게
+  // 만들기 위한 셔임(shim). 실제로는 브라우저의 localStorage 를 사용하고, 아티팩트
+  // 문서에 나온 것과 동일한 응답 형태(get/set/delete/list, 없는 키는 예외 throw)를 흉내낸다.
+  // - shared=false: 이 브라우저(이 기기)에만 저장되는 개인 데이터
+  // - shared=true : 이 셔임에서는 동일하게 localStorage 에 저장되므로, 사실상 다른 사람과는
+  //                 공유되지 않는다(테스트용이므로 실제 서버 공유 기능은 없음)
+  (function () {
+    const NS = "ml3_test_";
+    function storageKey(key, shared) {
+      return NS + (shared ? "shared__" : "priv__") + key;
+    }
+    window.storage = {
+      async get(key, shared = false) {
+        const raw = window.localStorage.getItem(storageKey(key, shared));
+        if (raw === null) throw new Error("key not found: " + key);
+        return { key, value: raw, shared };
+      },
+      async set(key, value, shared = false) {
+        window.localStorage.setItem(storageKey(key, shared), value);
+        return { key, value, shared };
+      },
+      async delete(key, shared = false) {
+        window.localStorage.removeItem(storageKey(key, shared));
+        return { key, deleted: true, shared };
+      },
+      async list(prefix = "", shared = false) {
+        const base = NS + (shared ? "shared__" : "priv__");
+        const full = base + prefix;
+        const keys = [];
+        for (let i = 0; i < window.localStorage.length; i++) {
+          const k = window.localStorage.key(i);
+          if (k && k.indexOf(full) === 0) keys.push(k.slice(base.length));
+        }
+        return { keys, prefix, shared };
+      },
+    };
+  })();
+</script>
+
+<script type="text/babel" data-type="module" data-presets="react">
+import React, { useCallback, useEffect, useRef, useReducer, useState } from "react";
+import ReactDOM from "react-dom/client";
+import { Clock, Trophy, RotateCcw, Skull, Volume2, VolumeX, Package, Coins, Heart, Pause, Play } from "lucide-react";
+
+/* ---------- tuning ---------- */
+const TILE_W = 72;
+const TILE_H = 36;
+const LIGHT_RADIUS = 2;
+
+const MOVES_TO_ACTIVATE = 20; // activation condition unchanged: still wakes after 20 tiles walked
+const STEALTH_MAX_DIST = 30; // while the shadow-cloak is active, the minotaur retreats along the trail until it's this many tiles behind
+const REVIVE_LIMIT = 3; // easy/normal: 3 revives total from the very first start of the run
+                         // (NOT refilled per floor) - the 4th death forces a full floor-1 reset,
+                         // which then refills the revive count back to 3 for the new run
+const DIFFICULTIES = {
+  easy: { junctions: 4, branches: 2, segMin: 3, segMax: 5, label: "쉬움" },
+  normal: { junctions: 6, branches: 3, segMin: 4, segMax: 7, label: "보통" },
+  hard: { junctions: 9, branches: 3, segMin: 5, segMax: 9, label: "악몽" },
+};
+const TIER_COLOR = { easy: "#6fae5a", normal: "#d9a63c", hard: "#d9555f" };
+
+/* ---------- lives & minotaur-speed schedule ----------
+   일반 입구: 목숨 5개. 폭탄을 밟아도 즉사하지 않고 목숨을 하나 잃을 뿐 - 1회·2회 부상까지는
+   미노타우르스 속도가 그대로지만, 3회부상시 0.4s, 4회부상시 0.2s로 빨라진다.
+   목숨이 0이 되는 5번째 피격에서야 비로소 진짜 "죽음"(현재 층/1층 재시작 페널티)이 발동한다.
+   스피드런 입구: 목숨 1개, 처음부터 미노타우르스가 0.3s로 전속력 추격 - 즉, 폭탄에
+   닿으면 곧바로 죽는 기존 방식 그대로, 목숨 buffer가 없다. ---------- */
+function livesForMode(mode) {
+  return mode === "speedrun" ? 1 : 5;
+}
+function minotaurSpeedForHits(mode, hitsTaken) {
+  if (mode === "speedrun") return 300;
+  if (hitsTaken >= 4) return 200;
+  if (hitsTaken >= 3) return 400;
+  return 500;
+}
+
+/* ---------- treasure-box life recovery ----------
+   Every correct-path box always grants gold, and on top of that has a small independent
+   chance to also restore a life (never above the mode's max), which un-does one hit's
+   worth of the minotaur speed-up proportionally - and a very rare chance to fully heal
+   back to max lives and reset the minotaur back to its base speed entirely. ---------- */
+const LIFE_FULL_HEAL_CHANCE = 0.02;
+const LIFE_PARTIAL_HEAL_CHANCE = 0.12;
+
+/* ---------- carried items ----------
+   Items are permanent player-owned inventory (persisted via window.storage), separate
+   from a single run's gold score - bought in the shop with gems, or occasionally found
+   for free in correct-path treasure boxes. Real-money purchase isn't possible inside a
+   Claude artifact, so gems stand in as the spendable currency here; when this game is
+   ever packaged as a native app, the gem-purchase button is the hook point to wire up
+   real IAP (buy gems with real money) without changing anything else about the shop. */
+const ITEMS = {
+  stealth: {
+    id: "stealth",
+    name: "그림자 망토",
+    icon: "🕶️",
+    shopCost: 120,
+    dropChance: 0.02,
+    duration: 50, // moves
+    desc: "50턴 동안 미노타우르스가 최대 30칸까지 뒤로 멀어져요 — 그 사이에 거리를 벌리세요",
+  },
+  invincible: {
+    id: "invincible",
+    name: "수호의 부적",
+    icon: "🛡️",
+    shopCost: 90,
+    dropChance: 0.02,
+    charges: 3, // blocks damage on the next 3 trap-box touches, however long that takes
+    desc: "함정상자를 밟아도 3회까지 피해를 입지 않아요",
+  },
+};
+const GEM_DROP_CHANCE = 0.05;
+
+/* ---------- named, permanently-fixed labyrinth entrances ----------
+   Each entrance always generates the exact same maze (via its seed), every time,
+   forever - not just cached for one session. Memorize the route once, speedrun it
+   any time you re-enter the same named entrance.
+   Every one of the 10 base routes also has a "speedrun" clone that shares the exact
+   same tier+seed (so it is byte-identical in layout) but plays under the harsher
+   1-life / 0.2s-minotaur speedrun ruleset - 10 base + 10 speedrun clones = 20 total. ---------- */
+const BASE_ROUTES = [
+  { id: 1, name: "잿빛 여명", tier: "easy", seed: 100001 },
+  { id: 2, name: "검은 갈대", tier: "easy", seed: 100002 },
+  { id: 3, name: "이끼 낀 계단", tier: "easy", seed: 100003 },
+  { id: 4, name: "붉은 달빛", tier: "normal", seed: 100004 },
+  { id: 5, name: "침묵의 회랑", tier: "normal", seed: 100005 },
+  { id: 6, name: "유리별", tier: "normal", seed: 100006 },
+  { id: 7, name: "잊혀진 서약", tier: "normal", seed: 100007 },
+  { id: 8, name: "안개숲", tier: "hard", seed: 100008 },
+  { id: 9, name: "황금가시", tier: "hard", seed: 100009 },
+  { id: 10, name: "마지막 등불", tier: "hard", seed: 100010 },
+];
+const ROUTES = [
+  ...BASE_ROUTES.map((r) => ({ ...r, mode: "normal" })),
+  ...BASE_ROUTES.map((r) => ({ ...r, id: r.id + 10, mode: "speedrun" })), // same tier+seed -> identical maze, harsher ruleset
+];
+
+const DIR_VECS = { N: { dr: -1, dc: 0 }, S: { dr: 1, dc: 0 }, E: { dr: 0, dc: 1 }, W: { dr: 0, dc: -1 } };
+const OPPOSITE = { N: "S", S: "N", E: "W", W: "E" };
+function shuffle(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+const DIRS = [
+  { dr: -1, dc: 0 },
+  { dr: 1, dc: 0 },
+  { dr: 0, dc: -1 },
+  { dr: 0, dc: 1 },
+];
+
+const key = (r, c) => `${r},${c}`;
+const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+const dist = (a, b) => Math.abs(a.row - b.row) + Math.abs(a.col - b.col);
+
+/* ---------- seeded PRNG (mulberry32) ---------- everything that shapes the maze's
+   *structure* (spine lengths, which fork is correct, tooth lengths) is drawn from this
+   instead of Math.random(), so the exact same seed always reconstructs the exact same
+   maze - forever, not just for the current session. Only cosmetic randomness (gold
+   amounts picked up mid-run) still uses the plain Math.random()-based rand() above. */
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function fmtTime(ms) {
+  const total = ms / 1000;
+  const m = Math.floor(total / 60);
+  const s = (total % 60).toFixed(1);
+  return `${String(m).padStart(2, "0")}:${s.padStart(4, "0")}`;
+}
+
+/* ---------- straight corridors that end in a fork; only one branch is correct ---------- */
+function carveStraight(grid, size, from, dirKey, length) {
+  const d = DIR_VECS[dirKey];
+  let cur = { ...from };
+  const carved = [];
+  for (let i = 0; i < length; i++) {
+    const nr = cur.row + d.dr, nc = cur.col + d.dc;
+    if (nr < 1 || nc < 1 || nr >= size - 1 || nc >= size - 1) break;
+    if (grid[nr][nc] === "floor") break;
+    grid[nr][nc] = "floor";
+    cur = { row: nr, col: nc };
+    carved.push(cur);
+  }
+  return { end: cur, carved };
+}
+
+/* ---------- comb-shaped junctions: main spine always runs South (the 1시->7시 isometric diagonal),
+   with lateral teeth (ㄷ = 2 arms E/W, ㅌ = 3 arms E/S/W) branching off. Only one tooth is correct.
+   `seed` makes the whole layout permanently reproducible: same seed -> same maze, always. ---------- */
+function generateMaze(diffKey, seed) {
+  const diff = DIFFICULTIES[diffKey];
+  const rng = mulberry32(seed);
+  const srand = (min, max) => Math.floor(rng() * (max - min + 1)) + min;
+  const size = Math.min(71, diff.junctions * (diff.segMax + 5) + 16) | 1;
+  const grid = Array.from({ length: size }, () => Array(size).fill("wall"));
+  const start = { row: 2, col: Math.floor(size / 2) };
+  grid[start.row][start.col] = "floor";
+  const correctPath = new Set([key(start.row, start.col)]);
+
+  let cur = { ...start };
+  const boxCells = new Set();
+
+  for (let j = 0; j < diff.junctions; j++) {
+    // spine segment leading up to this junction
+    const spineLen = srand(diff.segMin, diff.segMax);
+    const spine = carveStraight(grid, size, cur, "S", spineLen);
+    spine.carved.forEach((c) => correctPath.add(key(c.row, c.col)));
+    cur = spine.end;
+
+    // teeth: 2 branches = ㄷ (E + W arms), 3 branches = ㅌ (E + S + W arms)
+    const teeth = diff.branches >= 3 ? ["E", "S", "W"] : ["E", "W"];
+    const correctIdx = srand(0, teeth.length - 1);
+    let mainEnd = null;
+
+    for (let ti = 0; ti < teeth.length; ti++) {
+      const dirKey = teeth[ti];
+      const isCorrect = ti === correctIdx;
+      const toothLen = dirKey === "S" ? srand(diff.segMin, diff.segMax) : srand(2, 4);
+      const { end, carved } = carveStraight(grid, size, cur, dirKey, toothLen);
+      if (carved.length) boxCells.add(key(carved[0].row, carved[0].col)); // treasure box marks every fork entrance, including the straight-through arm
+      if (isCorrect) {
+        carved.forEach((c) => correctPath.add(key(c.row, c.col)));
+        if (dirKey === "S") {
+          mainEnd = end;
+        } else {
+          // lateral arm rejoins the southbound spine after its jog
+          const resume = carveStraight(grid, size, end, "S", srand(2, 4));
+          resume.carved.forEach((c) => correctPath.add(key(c.row, c.col)));
+          mainEnd = resume.carved.length ? resume.end : end;
+        }
+      }
+    }
+    if (!mainEnd) break;
+    cur = mainEnd;
+  }
+
+  // final straight stretch south to the goal
+  const finalStretch = carveStraight(grid, size, cur, "S", srand(diff.segMin, diff.segMax));
+  finalStretch.carved.forEach((c) => correctPath.add(key(c.row, c.col)));
+  const goal = finalStretch.carved.length ? finalStretch.end : cur;
+
+  // only the trap-box tile itself (the marked entrance of a WRONG branch) is dangerous -
+  // everything past it is just an ordinary (safe) dead end. Previously every single
+  // off-path floor tile was a bomb, so continuing to walk past an already-touched trap
+  // box kept re-triggering injuries on plain tiles with no box/warning on them at all.
+  const bombSet = new Set();
+  boxCells.forEach((k) => {
+    if (!correctPath.has(k)) bombSet.add(k);
+  });
+
+  return { size, grid, start, goal, correctPath, bombSet, boxCells };
+}
+
+function computeVisibleSet(grid, size, player, radius) {
+  const distMap = new Map();
+  const startK = key(player.row, player.col);
+  distMap.set(startK, 0);
+  const queue = [player];
+  const result = new Set([startK]);
+  while (queue.length) {
+    const cur = queue.shift();
+    const d = distMap.get(key(cur.row, cur.col));
+    if (d >= radius) continue;
+    for (const dir of DIRS) {
+      const nr = cur.row + dir.dr, nc = cur.col + dir.dc;
+      if (nr < 0 || nc < 0 || nr >= size || nc >= size) continue;
+      if (grid[nr][nc] === "wall") continue;
+      const k = key(nr, nc);
+      if (distMap.has(k)) continue;
+      distMap.set(k, d + 1);
+      result.add(k);
+      queue.push({ row: nr, col: nc });
+    }
+  }
+  return result;
+}
+
+function bfsPathTowards(grid, size, from, to) {
+  const prev = new Map();
+  const startK = key(from.row, from.col);
+  const seen = new Set([startK]);
+  const queue = [from];
+  while (queue.length) {
+    const cur = queue.shift();
+    if (cur.row === to.row && cur.col === to.col) break;
+    for (const d of DIRS) {
+      const nr = cur.row + d.dr, nc = cur.col + d.dc;
+      if (nr < 0 || nc < 0 || nr >= size || nc >= size) continue;
+      if (grid[nr][nc] === "wall") continue;
+      const k = key(nr, nc);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      prev.set(k, cur);
+      queue.push({ row: nr, col: nc });
+    }
+  }
+  const toK = key(to.row, to.col);
+  if (!prev.has(toK) && !(from.row === to.row && from.col === to.col)) return null;
+  const path = [];
+  let cur = to;
+  while (!(cur.row === from.row && cur.col === from.col)) {
+    path.unshift(cur);
+    const p = prev.get(key(cur.row, cur.col));
+    if (!p) return null;
+    cur = p;
+  }
+  return path;
+}
+
+function tilePos(row, col, size) {
+  const originX = ((size - 1) * TILE_W) / 2;
+  return { left: (col - row) * (TILE_W / 2) + originX, top: (col + row) * (TILE_H / 2) };
+}
+
+/* ---------- synthesized sfx ---------- */
+function makeDistortionCurve(amount) {
+  const n = 44100;
+  const curve = new Float32Array(n);
+  const deg = Math.PI / 180;
+  for (let i = 0; i < n; i++) {
+    const x = (i * 2) / n - 1;
+    curve[i] = ((3 + amount) * x * 20 * deg) / (Math.PI + amount * Math.abs(x));
+  }
+  return curve;
+}
+function createAudio() {
+  const state = { ctx: null, master: null, noiseBuffer: null, on: true };
+  function ensure() {
+    if (!state.ctx) {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return null;
+      state.ctx = new Ctx();
+      state.master = state.ctx.createGain();
+      state.master.gain.value = 0.4;
+      state.master.connect(state.ctx.destination);
+      const buf = state.ctx.createBuffer(1, state.ctx.sampleRate, state.ctx.sampleRate);
+      const data = buf.getChannelData(0);
+      for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+      state.noiseBuffer = buf;
+    }
+    if (state.ctx.state === "suspended") state.ctx.resume();
+    return state.ctx;
+  }
+  // trap hit: layered sub-bass thump + distorted noise body + sharp transient crack,
+  // so it lands with real physical weight instead of the old thin lowpass-noise hiss
+  function boom() {
+    const ctx = ensure();
+    if (!ctx || !state.on) return;
+    const now = ctx.currentTime;
+
+    // sub-bass thump - the part you'd feel more than hear, gives the hit weight
+    const sub = ctx.createOscillator();
+    sub.type = "sine";
+    sub.frequency.setValueAtTime(130, now);
+    sub.frequency.exponentialRampToValueAtTime(28, now + 0.32);
+    const subGain = ctx.createGain();
+    subGain.gain.setValueAtTime(1.0, now);
+    subGain.gain.exponentialRampToValueAtTime(0.001, now + 0.5);
+    sub.connect(subGain);
+    subGain.connect(state.master);
+    sub.start(now);
+    sub.stop(now + 0.52);
+
+    // distorted noise body - waveshaper crunch instead of a clean lowpass sweep
+    const src = ctx.createBufferSource();
+    src.buffer = state.noiseBuffer;
+    const shaper = ctx.createWaveShaper();
+    shaper.curve = makeDistortionCurve(65);
+    shaper.oversample = "4x";
+    const filter = ctx.createBiquadFilter();
+    filter.type = "lowpass";
+    filter.frequency.setValueAtTime(2600, now);
+    filter.frequency.exponentialRampToValueAtTime(100, now + 0.55);
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.9, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.65);
+    src.connect(shaper);
+    shaper.connect(filter);
+    filter.connect(gain);
+    gain.connect(state.master);
+    src.start(now);
+    src.stop(now + 0.66);
+
+    // sharp high crack on top for bite/impact at the very start of the hit
+    const crack = ctx.createBufferSource();
+    crack.buffer = state.noiseBuffer;
+    const crackFilter = ctx.createBiquadFilter();
+    crackFilter.type = "highpass";
+    crackFilter.frequency.value = 2800;
+    const crackGain = ctx.createGain();
+    crackGain.gain.setValueAtTime(0.75, now);
+    crackGain.gain.exponentialRampToValueAtTime(0.001, now + 0.08);
+    crack.connect(crackFilter);
+    crackFilter.connect(crackGain);
+    crackGain.connect(state.master);
+    crack.start(now);
+    crack.stop(now + 0.09);
+  }
+  function roar() {
+    const ctx = ensure();
+    if (!ctx || !state.on) return;
+    const osc = ctx.createOscillator();
+    osc.type = "sawtooth";
+    osc.frequency.setValueAtTime(120, ctx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(50, ctx.currentTime + 0.5);
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.5, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.55);
+    osc.connect(gain);
+    gain.connect(state.master);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.56);
+  }
+  function chime(freq = 660) {
+    const ctx = ensure();
+    if (!ctx || !state.on) return;
+    const osc = ctx.createOscillator();
+    osc.type = "triangle";
+    osc.frequency.value = freq;
+    const gain = ctx.createGain();
+    const now = ctx.currentTime;
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.linearRampToValueAtTime(0.2, now + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.4);
+    osc.connect(gain);
+    gain.connect(state.master);
+    osc.start(now);
+    osc.stop(now + 0.42);
+  }
+  function fanfare() {
+    [660, 880, 1100].forEach((f, i) => setTimeout(() => chime(f), i * 110));
+  }
+  function footstep() {
+    const ctx = ensure();
+    if (!ctx || !state.on) return;
+    const src = ctx.createBufferSource();
+    src.buffer = state.noiseBuffer;
+    const filter = ctx.createBiquadFilter();
+    filter.type = "highpass";
+    filter.frequency.value = 1600;
+    const gain = ctx.createGain();
+    const now = ctx.currentTime;
+    gain.gain.setValueAtTime(0.14, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.07);
+    src.connect(filter);
+    filter.connect(gain);
+    gain.connect(state.master);
+    const offset = Math.random() * (state.noiseBuffer.duration - 0.1);
+    src.start(now, offset, 0.08);
+  }
+  // eerie ambient bed: two slightly-detuned low saws (slow beating = unsettling, not
+  // musical) run continuously through a filter that a slow LFO "breathes" through, plus
+  // sparse dissonant high notes and (once danger is high) a low heartbeat thump. All of it
+  // reacts continuously to getDanger() rather than just changing one pulse's pitch/tempo.
+  function startDrone() {
+    const ctx = ensure();
+    if (!ctx || state.droneNodes) return;
+    const now = ctx.currentTime;
+    const filter = ctx.createBiquadFilter();
+    filter.type = "lowpass";
+    filter.frequency.value = 260;
+    filter.Q.value = 1.4;
+    const droneGain = ctx.createGain();
+    droneGain.gain.setValueAtTime(0.0001, now);
+    droneGain.gain.linearRampToValueAtTime(0.08, now + 2.5);
+    filter.connect(droneGain);
+    droneGain.connect(state.master);
+
+    const osc1 = ctx.createOscillator();
+    osc1.type = "sawtooth";
+    osc1.frequency.value = 55; // low A
+    osc1.connect(filter);
+    osc1.start(now);
+
+    const osc2 = ctx.createOscillator();
+    osc2.type = "sawtooth";
+    osc2.frequency.value = 58.3; // detuned against osc1 -> slow, sickly beating
+    osc2.connect(filter);
+    osc2.start(now);
+
+    const lfo = ctx.createOscillator();
+    lfo.type = "sine";
+    lfo.frequency.value = 0.06;
+    const lfoGain = ctx.createGain();
+    lfoGain.gain.value = 160;
+    lfo.connect(lfoGain);
+    lfoGain.connect(filter.frequency);
+    lfo.start(now);
+
+    state.droneNodes = { filter, droneGain, osc1, osc2, lfo, lfoGain };
+  }
+  function stopDrone() {
+    if (!state.droneNodes || !state.ctx) {
+      state.droneNodes = null;
+      return;
+    }
+    const { droneGain, osc1, osc2, lfo } = state.droneNodes;
+    const now = state.ctx.currentTime;
+    droneGain.gain.cancelScheduledValues(now);
+    droneGain.gain.setValueAtTime(droneGain.gain.value, now);
+    droneGain.gain.linearRampToValueAtTime(0.0001, now + 0.7);
+    [osc1, osc2, lfo].forEach((o) => {
+      try {
+        o.stop(now + 0.8);
+      } catch (e) {}
+    });
+    state.droneNodes = null;
+  }
+  // sparse dissonant high note - a bandpass-filtered tone drawn from a tight cluster of
+  // clashing frequencies (minor 2nds), like something creaking or breathing in the dark
+  function eerieNote(danger) {
+    const ctx = state.ctx;
+    if (!ctx || !state.on) return;
+    const now = ctx.currentTime;
+    const pool = [196.0, 207.65, 233.08, 246.94, 277.18, 311.13];
+    const base = pool[Math.floor(Math.random() * pool.length)];
+    const freq = base * (1 + danger * 0.12);
+    const osc = ctx.createOscillator();
+    osc.type = Math.random() < 0.5 ? "sine" : "triangle";
+    osc.frequency.setValueAtTime(freq, now);
+    osc.frequency.exponentialRampToValueAtTime(freq * (Math.random() < 0.5 ? 0.965 : 1.035), now + 2.2);
+    const filter = ctx.createBiquadFilter();
+    filter.type = "bandpass";
+    filter.frequency.value = freq * 2;
+    filter.Q.value = 4;
+    const gain = ctx.createGain();
+    const peak = 0.05 + danger * 0.05;
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.linearRampToValueAtTime(peak, now + 0.9);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 2.4);
+    osc.connect(filter);
+    filter.connect(gain);
+    gain.connect(state.master);
+    osc.start(now);
+    osc.stop(now + 2.5);
+  }
+  // low thump that only starts appearing once the minotaur is close - reads like a
+  // heartbeat picking up, separate from the footstep sfx
+  function heartbeat(danger) {
+    const ctx = state.ctx;
+    if (!ctx || !state.on) return;
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(60, now);
+    osc.frequency.exponentialRampToValueAtTime(34, now + 0.22);
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.001, now);
+    gain.gain.linearRampToValueAtTime(0.22 + danger * 0.15, now + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.28);
+    osc.connect(gain);
+    gain.connect(state.master);
+    osc.start(now);
+    osc.stop(now + 0.3);
+  }
+  function startMusic(getDanger) {
+    ensure();
+    startDrone();
+    if (state.musicTimer) return;
+    const scheduleNext = () => {
+      if (!state.on || !state.ctx) {
+        state.musicTimer = setTimeout(scheduleNext, 500);
+        return;
+      }
+      const danger = Math.max(0, Math.min(1, getDanger()));
+      const now = state.ctx.currentTime;
+      if (state.droneNodes) {
+        state.droneNodes.filter.frequency.setTargetAtTime(260 + danger * 520, now, 0.4);
+        state.droneNodes.osc2.frequency.setTargetAtTime(58.3 + danger * 7, now, 0.4);
+        state.droneNodes.droneGain.gain.setTargetAtTime(0.07 + danger * 0.06, now, 0.5);
+      }
+      if (Math.random() < 0.5 + danger * 0.35) eerieNote(danger);
+      if (danger > 0.4 && Math.random() < danger * 0.5) heartbeat(danger);
+      const interval = (2600 - danger * 1700) * (0.7 + Math.random() * 0.6);
+      state.musicTimer = setTimeout(scheduleNext, interval);
+    };
+    scheduleNext();
+  }
+  function stopMusic() {
+    if (state.musicTimer) clearTimeout(state.musicTimer);
+    state.musicTimer = null;
+    stopDrone();
+  }
+  function setEnabled(on) {
+    state.on = on;
+    if (on) ensure();
+    else stopMusic();
+  }
+  return { ensure, boom, roar, chime, fanfare, footstep, startMusic, stopMusic, setEnabled, state };
+}
+
+function initLife(maze, route) {
+  const maxLives = livesForMode(route.mode);
+  const s = {
+    maze,
+    route,
+    floor: 1,
+    revivesUsed: 0,
+    maxLives,
+    lives: maxLives,
+    hitsTaken: 0,
+    minotaurStepMs: minotaurSpeedForHits(route.mode, 0),
+    stealthMovesLeft: 0,
+    trapGuardCharges: 0,
+    paused: false,
+    pausedAt: null,
+    player: { ...maze.start },
+    minotaur: { ...maze.start },
+    minotaurActive: false,
+    playerTrail: [{ row: maze.start.row, col: maze.start.col }],
+    minotaurTrailIdx: 0,
+    minotaurDist: null,
+    moveCount: 0,
+    gold: 0,
+    floaters: [],
+    floaterSeq: 0,
+    visible: new Set(),
+    explored: new Set(),
+    takenBoxes: new Set(),
+    gameState: "playing",
+  };
+  s.visible = computeVisibleSet(s.maze.grid, s.maze.size, s.player, LIGHT_RADIUS);
+  s.visible.forEach((k) => s.explored.add(k));
+  return s;
+}
+
+function MinotaurLabyrinth() {
+  const [difficulty, setDifficulty] = useState("easy");
+  // permanent per-route maze cache, keyed by "routeId:floorNumber" - purely a perf cache now,
+  // since generateMaze(tier, seed) is deterministic and would reconstruct the identical
+  // layout anyway; this just avoids recomputing it on every revisit.
+  const mazeCacheRef = useRef({});
+  const getOrGenMaze = useCallback((route, floorNum) => {
+    const cache = mazeCacheRef.current;
+    const k = `${route.id}:${floorNum}`;
+    if (!cache[k]) cache[k] = generateMaze(route.tier, route.seed * 1000 + floorNum);
+    return cache[k];
+  }, []);
+  const stateRef = useRef(null);
+  if (!stateRef.current) {
+    stateRef.current = initLife(getOrGenMaze(ROUTES[0], 1), ROUTES[0]);
+  }
+  const [, forceRender] = useReducer((x) => x + 1, 0);
+  const playerTokenRef = useRef(null);
+  const update = useCallback(() => forceRender(), []);
+
+  const audioRef = useRef(null);
+  if (!audioRef.current) audioRef.current = createAudio();
+
+  const [attempts, setAttempts] = useState(0);
+  const [startedAt, setStartedAt] = useState(Date.now());
+  const [elapsed, setElapsed] = useState(0);
+  const [muted, setMuted] = useState(false);
+  const [screen, setScreen] = useState("start"); // "start" | "playing"
+  const [nickname, setNickname] = useState("");
+  const [nicknameDraft, setNicknameDraft] = useState("");
+  const [nicknameChecked, setNicknameChecked] = useState(false); // avoids flashing the input before the saved nickname loads
+  const [editingNickname, setEditingNickname] = useState(false); // lets the player deliberately change an already-registered nickname
+  const [pendingRouteId, setPendingRouteId] = useState(ROUTES[0].id);
+  const [gems, setGems] = useState(0);
+  const [inventory, setInventory] = useState({ stealth: 0, invincible: 0 });
+  const [walletChecked, setWalletChecked] = useState(false);
+  const [shopOpen, setShopOpen] = useState(false);
+  // single source of truth for gems/items, mirrored into React state above only for
+  // rendering - avoids stale-closure bugs when items drop mid-move inside stepAlong
+  const walletRef = useRef({ gems: 0, inventory: { stealth: 0, invincible: 0 } });
+  const mutateWallet = useCallback((fn) => {
+    const next = fn(walletRef.current);
+    walletRef.current = next;
+    setGems(next.gems);
+    setInventory(next.inventory);
+    window.storage.set("minotaur3-wallet", JSON.stringify(next), false).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get("minotaur3-nickname", false);
+        if (res) {
+          const data = JSON.parse(res.value);
+          if (data.nickname) {
+            setNickname(data.nickname);
+            setNicknameDraft(data.nickname);
+          }
+        }
+      } catch (e) {
+      } finally {
+        setNicknameChecked(true);
+      }
+    })();
+  }, []);
+
+  // permanent, cross-run wallet: gems + owned items survive death/new-attempt/new-maze,
+  // unlike the per-run gold score which resets with each attempt
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get("minotaur3-wallet", false);
+        if (res) {
+          const data = JSON.parse(res.value);
+          const loaded = {
+            gems: typeof data.gems === "number" ? data.gems : 0,
+            inventory: { stealth: 0, invincible: 0, ...(data.inventory || {}) },
+          };
+          walletRef.current = loaded;
+          setGems(loaded.gems);
+          setInventory(loaded.inventory);
+        }
+      } catch (e) {
+      } finally {
+        setWalletChecked(true);
+      }
+    })();
+  }, []);
+
+  const s = stateRef.current;
+
+  useEffect(() => {
+    if (s.gameState !== "playing" && s.gameState !== "won") return;
+    const iv = setInterval(() => {
+      const st = stateRef.current;
+      if (st.gameState === "playing" && !st.paused) setElapsed(Date.now() - startedAt);
+    }, 100);
+    return () => clearInterval(iv);
+  }, [startedAt, s.gameState]);
+
+  // pause: freezes the minotaur, the timer, and all movement input in place. Resuming
+  // shifts startedAt forward by exactly how long the pause lasted, so the displayed timer
+  // picks back up right where it left off instead of jumping ahead by the paused duration.
+  const togglePause = () => {
+    const st = stateRef.current;
+    if (st.gameState !== "playing") return;
+    if (!st.paused) {
+      st.paused = true;
+      st.pausedAt = Date.now();
+      update();
+    } else {
+      const now = Date.now();
+      const pausedDuration = now - (st.pausedAt || now);
+      st.paused = false;
+      st.pausedAt = null;
+      setStartedAt((prev) => prev + pausedDuration);
+      update();
+    }
+  };
+
+  const musicStartedRef = useRef(false);
+  const startMusicIfNeeded = () => {
+    if (musicStartedRef.current) return;
+    musicStartedRef.current = true;
+    audioRef.current.startMusic(() => {
+      const st = stateRef.current;
+      if (!st.minotaurActive || st.minotaurDist === null) return 0;
+      return Math.max(0, Math.min(1, 1 - st.minotaurDist / 20));
+    });
+  };
+  useEffect(() => () => audioRef.current.stopMusic(), []);
+
+  // minotaur: only ever retraces the player's own footstep trail, guaranteed to always stay
+  // behind, never able to cut through a branch and appear ahead. Activation condition (20
+  // moves) is unchanged. Chase speed is read dynamically every tick from st.minotaurStepMs
+  // (500ms base -> 400ms after 1 injury -> 200ms after 2 injuries, or a flat 300ms on
+  // speedrun entrances) so a mid-run speed change takes effect immediately, without having
+  // to tear down and recreate the interval. While the shadow-cloak (stealth item) is active,
+  // this same trail-index walk runs in reverse instead of forward - the minotaur steadily
+  // falls back until it's STEALTH_MAX_DIST tiles behind, then holds there, and resumes
+  // chasing forward from wherever it ended up the moment stealth runs out.
+  useEffect(() => {
+    let acc = 0;
+    const TICK_MS = 50;
+    const iv = setInterval(() => {
+      const st = stateRef.current;
+      if (st.gameState !== "playing" || !st.minotaurActive || st.paused) {
+        acc = 0;
+        return;
+      }
+      acc += TICK_MS;
+      const stepMs = st.minotaurStepMs || 500;
+      if (acc < stepMs) return;
+      acc -= stepMs;
+      const lastIdx = st.playerTrail.length - 1;
+      if (st.stealthMovesLeft > 0) {
+        const curDist = Math.max(0, lastIdx - st.minotaurTrailIdx);
+        if (curDist < STEALTH_MAX_DIST) {
+          st.minotaurTrailIdx = Math.max(st.minotaurTrailIdx - 1, lastIdx - STEALTH_MAX_DIST);
+        }
+      } else {
+        st.minotaurTrailIdx = Math.min(st.minotaurTrailIdx + 1, lastIdx);
+      }
+      st.minotaurDist = Math.max(0, lastIdx - st.minotaurTrailIdx);
+      const pos = st.playerTrail[Math.max(0, st.minotaurTrailIdx)];
+      if (pos) st.minotaur = { row: pos.row, col: pos.col };
+      if (st.stealthMovesLeft <= 0 && st.minotaurTrailIdx >= lastIdx && st.minotaur.row === st.player.row && st.minotaur.col === st.player.col) {
+        triggerCaught();
+        return;
+      }
+      update();
+    }, TICK_MS);
+    return () => clearInterval(iv);
+  }, [update]);
+
+  const startNewMaze = useCallback((route) => {
+    setDifficulty(route.tier);
+    // this named entrance's floor-1 layout is 100% fixed by its seed - reuses the cache
+    // if already generated this session, but would reconstruct byte-identical either way
+    const maze = getOrGenMaze(route, 1);
+    stateRef.current = initLife(maze, route);
+    setAttempts(0);
+    setStartedAt(Date.now());
+    setElapsed(0);
+    spawnFloater(maze.start.row, maze.start.col, `${route.name}의 길`, "#e0b23c");
+    update();
+  }, [update, getOrGenMaze]);
+
+  const beginGame = () => {
+    // only register/overwrite the nickname on first-ever start or when the player
+    // explicitly chose to change it - repeat visits to the start screen (e.g. after
+    // dying and picking "입구 선택") reuse the already-registered nickname untouched
+    if (!nickname || editingNickname) {
+      const nm = nicknameDraft.trim().slice(0, 12) || "모험가";
+      setNickname(nm);
+      window.storage.set("minotaur3-nickname", JSON.stringify({ nickname: nm }), false).catch(() => {});
+    }
+    setEditingNickname(false);
+    startMusicIfNeeded();
+    const route = ROUTES.find((r) => r.id === pendingRouteId) || ROUTES[0];
+    startNewMaze(route);
+    setScreen("playing");
+  };
+
+  const backToDifficultySelect = () => {
+    setScreen("start");
+  };
+
+  const retrySameMaze = () => {
+    const st = stateRef.current;
+    stateRef.current = initLife(st.maze, st.route);
+    setAttempts(0);
+    setStartedAt(Date.now());
+    setElapsed(0);
+    update();
+  };
+
+  const resetAttempt = () => {
+    const st = stateRef.current;
+    // out of lives - the true "death" penalty finally applies, and life/speed reset fresh
+    st.maxLives = livesForMode(st.route.mode);
+    st.lives = st.maxLives;
+    st.hitsTaken = 0;
+    st.minotaurStepMs = minotaurSpeedForHits(st.route.mode, 0);
+    st.stealthMovesLeft = 0;
+    st.trapGuardCharges = 0;
+    // 난이도별 부활 시 소지 아이템(그림자 망토/수호 부적) 처리 - 부활 횟수(같은 층 부활이든
+    // 횟수 소진 후 1층 전체 재시작이든)와 무관하게 항상 적용된다:
+    // - 쉬움: 소지 아이템 유지
+    // - 보통: 부활할 때마다 소지 아이템을 전부 초기화
+    // - 악몽: 부활이라는 개념 자체가 없음(항상 1층부터 재시작) - 아래 tier==="hard" 분기 참고
+    if (st.route.tier === "normal") {
+      mutateWallet((w) => ({ ...w, inventory: { stealth: 0, invincible: 0 } }));
+    }
+    // 악몽 난이도는 원래도 매번 1층부터. 쉬움/보통은 최초 시작 기준으로 REVIVE_LIMIT(3)번까지만
+    // "부활"(같은 층 시작점에서 재시작)을 허용한다 - 층이 바뀌어도 이 카운트는 리셋되지 않는다.
+    // 그 횟수를 다 쓰면 이후로는 악몽과 동일하게 1층부터 완전히 재시작하고, 그 시점에 부활
+    // 카운트도 다시 3회로 채워진다(=새로운 도전의 시작으로 취급).
+    const outOfRevives = st.revivesUsed >= REVIVE_LIMIT;
+    if (st.route.tier === "hard" || outOfRevives) {
+      // 1층부터 완전히 새로 시작 (골드도 초기화) -
+      // 다만 미로 구조 자체는 새로 뽑지 않고 이 입구의 1층 미로(시드로 고정됨)를 그대로 재사용한다
+      // (스피드런은 외운 길로 다시 도전하는 게임이므로 층 구조는 절대 안 바뀜)
+      const maze = getOrGenMaze(st.route, 1);
+      st.floor = 1;
+      st.revivesUsed = 0;
+      st.maze = maze;
+      st.player = { ...maze.start };
+      st.minotaur = { ...maze.start };
+      st.minotaurActive = false;
+      st.playerTrail = [{ row: maze.start.row, col: maze.start.col }];
+      st.minotaurTrailIdx = 0;
+      st.minotaurDist = null;
+      st.moveCount = 0;
+      st.gold = 0;
+      st.visible = computeVisibleSet(maze.grid, maze.size, st.player, LIGHT_RADIUS);
+      st.explored = new Set();
+      st.visible.forEach((k) => st.explored.add(k));
+      st.takenBoxes = new Set();
+      st.gameState = "playing";
+      update();
+      return;
+    }
+    // 쉬움/보통: 현재 층의 시작점에서 부활 (층 진행도·골드는 유지) - 최초 시작 기준
+    // 남은 부활 횟수를 하나 소진한다 (층이 바뀌어도 이 카운트는 그대로 이어짐)
+    st.revivesUsed += 1;
+    st.player = { ...st.maze.start };
+    st.minotaur = { ...st.maze.start };
+    st.minotaurActive = false;
+    st.playerTrail = [{ row: st.maze.start.row, col: st.maze.start.col }];
+    st.minotaurTrailIdx = 0;
+    st.minotaurDist = null;
+    st.moveCount = 0;
+    st.visible = computeVisibleSet(st.maze.grid, st.maze.size, st.player, LIGHT_RADIUS);
+    st.explored = new Set();
+    st.visible.forEach((k) => st.explored.add(k));
+    st.takenBoxes = new Set();
+    st.gameState = "playing";
+    update();
+  };
+
+  const nextFloor = () => {
+    const st = stateRef.current;
+    st.floor += 1;
+    // NOTE: revivesUsed is intentionally NOT reset here - the revive budget is tracked
+    // from the very first start of the run, not refilled per floor. It only refills when
+    // a full floor-1 reset happens (see resetAttempt).
+    // same cache lookup: revisiting this floor number (e.g. after a hard-mode reset
+    // back to floor 1) hands back the identical layout instead of a new random one -
+    // and since it's seeded from this entrance's route, it's fixed permanently, not
+    // just for this session
+    const maze = getOrGenMaze(st.route, st.floor);
+    st.maze = maze;
+    st.player = { ...maze.start };
+    st.playerTrail = [{ row: maze.start.row, col: maze.start.col }];
+    st.minotaur = { row: maze.start.row, col: maze.start.col };
+    // the minotaur carries its chase state over from the previous floor instead of
+    // needing another 20 moves to wake up - if it was already active, it starts this
+    // floor exactly as many tiles behind as it was when the stairs were reached
+    if (st.minotaurActive) {
+      st.minotaurTrailIdx = -(st.minotaurDist || 0);
+    } else {
+      st.minotaurTrailIdx = 0;
+    }
+    st.visible = computeVisibleSet(maze.grid, maze.size, st.player, LIGHT_RADIUS);
+    st.explored = new Set();
+    st.visible.forEach((k) => st.explored.add(k));
+    st.takenBoxes = new Set();
+    st.gameState = "playing";
+    audioRef.current.fanfare();
+    spawnFloater(maze.start.row, maze.start.col, `지하 ${st.floor}층`, "#e0b23c");
+    update();
+  };
+
+  // bomb hit: costs one life. If any remain, this is just an "injury" - the player keeps
+  // standing exactly where they got hit (st.player was already moved onto this tile by
+  // stepAlong right before this runs) and simply keeps moving from there; the minotaur's
+  // chase state is left completely untouched, only its speed ramps up. Only when lives
+  // hit 0 does the real "death" penalty (existing tier-based floor/run reset) apply.
+  // Returns true if the player is still alive (playing continues), false if it was fatal.
+  const handleBombHit = () => {
+    const st = stateRef.current;
+    st.lives = Math.max(0, st.lives - 1);
+    audioRef.current.boom();
+    if (st.lives > 0) {
+      st.hitsTaken += 1;
+      st.minotaurStepMs = minotaurSpeedForHits(st.route.mode, st.hitsTaken);
+      spawnFloater(st.player.row, st.player.col, `💥 부상! 남은 목숨 ${st.lives}`, "#ff6a5a");
+      return true;
+    }
+    // 목숨이 다 떨어졌을 때만 진짜 죽음 처리 (기존 페널티: 쉬움/보통은 층 유지, 악몽은 1층부터)
+    st.gameState = "exploded";
+    setAttempts((a) => a + 1);
+    update();
+    return false;
+  };
+
+  // minotaur catch is unaffected by lives - it's an instant, full "death" exactly as before
+  // (staying "injured" on the very tile the minotaur is standing on doesn't make sense)
+  const triggerCaught = () => {
+    const st = stateRef.current;
+    st.gameState = "caught";
+    audioRef.current.roar();
+    setAttempts((a) => a + 1);
+    update();
+  };
+
+  const movingRef = useRef(false);
+
+  const spawnFloater = (row, col, text, color) => {
+    const s = stateRef.current;
+    const pos = tilePos(row, col, s.maze.size);
+    s.floaterSeq += 1;
+    const id = s.floaterSeq;
+    s.floaters = [...s.floaters, { id, left: pos.left + TILE_W / 2, top: pos.top, text, color }];
+    setTimeout(() => {
+      const st = stateRef.current;
+      st.floaters = st.floaters.filter((f) => f.id !== id);
+      update();
+    }, 800);
+  };
+
+  // consumes one owned item from the permanent wallet and activates its effect on the
+  // current run - stealth counts down in player moves, the trap-ward stacks up a number
+  // of "charges" that each shrug off exactly one trap-box hit, however long that takes
+  const useItem = (itemId) => {
+    const st = stateRef.current;
+    if (st.gameState !== "playing") return;
+    if ((walletRef.current.inventory[itemId] || 0) <= 0) return;
+    mutateWallet((w) => ({ ...w, inventory: { ...w.inventory, [itemId]: w.inventory[itemId] - 1 } }));
+    if (itemId === "stealth") {
+      st.stealthMovesLeft = ITEMS.stealth.duration;
+      spawnFloater(st.player.row, st.player.col, `${ITEMS.stealth.icon} 은신!`, "#c9b6ff");
+    } else if (itemId === "invincible") {
+      st.trapGuardCharges = (st.trapGuardCharges || 0) + ITEMS.invincible.charges;
+      spawnFloater(st.player.row, st.player.col, `${ITEMS.invincible.icon} 수호 ${st.trapGuardCharges}회!`, "#ffe37f");
+    }
+    audioRef.current.chime(1040);
+    update();
+  };
+
+  // spend gems to buy one item in the shop
+  const buyItem = (itemId) => {
+    const item = ITEMS[itemId];
+    if (walletRef.current.gems < item.shopCost) return;
+    mutateWallet((w) => ({ gems: w.gems - item.shopCost, inventory: { ...w.inventory, [itemId]: w.inventory[itemId] + 1 } }));
+  };
+
+  const stepAlong = (path) => {
+    movingRef.current = true;
+    let i = 0;
+    const doStep = () => {
+      const st = stateRef.current;
+      if (st.gameState !== "playing" || i >= path.length) {
+        movingRef.current = false;
+        return;
+      }
+      const cell = path[i];
+      i += 1;
+      st.player = { row: cell.row, col: cell.col };
+      audioRef.current.footstep();
+
+      const lastTrail = st.playerTrail[st.playerTrail.length - 1];
+      if (!lastTrail || lastTrail.row !== cell.row || lastTrail.col !== cell.col) {
+        st.playerTrail.push({ row: cell.row, col: cell.col });
+      }
+      st.moveCount += 1;
+      if (st.stealthMovesLeft > 0) st.stealthMovesLeft -= 1;
+      if (!st.minotaurActive && st.moveCount >= MOVES_TO_ACTIVATE) {
+        st.minotaurActive = true;
+        st.minotaurTrailIdx = 0;
+        st.minotaurDist = st.playerTrail.length - 1;
+        audioRef.current.roar();
+      }
+
+      const ck = key(cell.row, cell.col);
+      if (st.maze.bombSet.has(ck) && !st.takenBoxes.has(ck)) {
+        // trap springs once, then disappears just like a real box does - stepping on
+        // the same tile again afterward is safe, it doesn't keep re-triggering forever
+        st.takenBoxes.add(ck);
+        const guarded = st.trapGuardCharges > 0;
+        if (guarded) {
+          st.trapGuardCharges -= 1;
+          spawnFloater(cell.row, cell.col, `🛡️ 방어! (남은 ${st.trapGuardCharges}회)`, "#ffe37f");
+          audioRef.current.chime(880);
+        } else {
+          const stillAlive = handleBombHit();
+          if (!stillAlive) {
+            movingRef.current = false;
+            return;
+          }
+        }
+        // survived (or shrugged off entirely): fall through so visibility/exploration
+        // around this tile still updates and play continues seamlessly from right here
+      }
+      if (st.maze.boxCells.has(ck) && !st.takenBoxes.has(ck) && !st.maze.bombSet.has(ck)) {
+        // a bomb/trap box (wrong branch) never grants gold - only the real (correct-path) box does
+        st.takenBoxes.add(ck);
+        const goldGain = 8 + rand(0, 8);
+        st.gold += goldGain;
+        spawnFloater(cell.row, cell.col, `+${goldGain}G`, "#e0b23c");
+        audioRef.current.chime(760);
+
+        // small independent chance to also recover a life - and a very rare chance to
+        // fully heal. Either way this proportionally rolls the minotaur's speed back down
+        // (never below the base for however many hits remain unhealed), and lives can
+        // never climb past this mode's max no matter how many heals are picked up.
+        const healRoll = Math.random();
+        if (healRoll < LIFE_FULL_HEAL_CHANCE) {
+          if (st.lives < st.maxLives) {
+            st.lives = st.maxLives;
+            st.hitsTaken = 0;
+            st.minotaurStepMs = minotaurSpeedForHits(st.route.mode, 0);
+            spawnFloater(cell.row, cell.col, "✨완전 회복!", "#7fe0a8");
+            audioRef.current.fanfare();
+          }
+        } else if (healRoll < LIFE_FULL_HEAL_CHANCE + LIFE_PARTIAL_HEAL_CHANCE) {
+          if (st.lives < st.maxLives) {
+            st.lives = Math.min(st.maxLives, st.lives + 1);
+            st.hitsTaken = Math.max(0, st.hitsTaken - 1);
+            st.minotaurStepMs = minotaurSpeedForHits(st.route.mode, st.hitsTaken);
+            spawnFloater(cell.row, cell.col, "❤️생명 +1", "#ff9a8a");
+            audioRef.current.chime(920);
+          }
+        }
+
+        // independent small chances for permanent (cross-run) drops: a gem, or a full
+        // carried item - separate rolls from the life-heal roll above so they can stack
+        if (Math.random() < GEM_DROP_CHANCE) {
+          mutateWallet((w) => ({ ...w, gems: w.gems + 1 }));
+          spawnFloater(cell.row, cell.col, "💎+1", "#8fd7ff");
+        }
+        const itemRoll = Math.random();
+        if (itemRoll < ITEMS.stealth.dropChance) {
+          mutateWallet((w) => ({ ...w, inventory: { ...w.inventory, stealth: w.inventory.stealth + 1 } }));
+          spawnFloater(cell.row, cell.col, `${ITEMS.stealth.icon} ${ITEMS.stealth.name} 획득!`, "#c9b6ff");
+        } else if (itemRoll < ITEMS.stealth.dropChance + ITEMS.invincible.dropChance) {
+          mutateWallet((w) => ({ ...w, inventory: { ...w.inventory, invincible: w.inventory.invincible + 1 } }));
+          spawnFloater(cell.row, cell.col, `${ITEMS.invincible.icon} ${ITEMS.invincible.name} 획득!`, "#ffe37f");
+        }
+      }
+      st.visible = computeVisibleSet(st.maze.grid, st.maze.size, st.player, LIGHT_RADIUS);
+      st.visible.forEach((k) => st.explored.add(k));
+      if (cell.row === st.maze.goal.row && cell.col === st.maze.goal.col) {
+        movingRef.current = false;
+        nextFloor();
+        return;
+      }
+      update();
+      setTimeout(doStep, 130);
+    };
+    doStep();
+  };
+
+  const handleTileClick = (row, col) => {
+    startMusicIfNeeded();
+    const st = stateRef.current;
+    if (st.gameState !== "playing" || movingRef.current || st.paused) return;
+    if (!st.explored.has(key(row, col))) return;
+    if (st.maze.grid[row][col] === "wall") return;
+    if (row === st.player.row && col === st.player.col) return;
+    const path = bfsPathTowards(st.maze.grid, st.maze.size, st.player, { row, col });
+    if (!path || !path.length) return;
+    stepAlong([path[0]]); // tapping any tile only ever advances one step toward it
+  };
+
+  const toggleMute = () => {
+    const next = !muted;
+    setMuted(next);
+    audioRef.current.setEnabled(!next);
+    if (!next) {
+      audioRef.current.startMusic(() => {
+        const st = stateRef.current;
+        if (!st.minotaurActive || st.minotaurDist === null) return 0;
+        return Math.max(0, Math.min(1, 1 - st.minotaurDist / 20));
+      });
+    }
+  };
+
+  const minoDist = s.minotaurActive && s.minotaurDist !== null ? s.minotaurDist : null;
+  const dangerOpacity = minoDist !== null ? Math.max(0, Math.min(0.5, 0.5 - minoDist * 0.025)) : 0;
+  // camera: the player tile is always rendered at the exact center of the viewport, and
+  // the maze content is translated underneath it instead of the old native-scroll
+  // scrollIntoView approach - so the death/pause overlay can just be pinned to dead-center
+  // of the outer viewport rather than to any maze-coordinate pixel position.
+  const overlayShown = s.gameState === "exploded" || s.gameState === "caught" || (s.gameState === "playing" && s.paused);
+  const playerPixel = tilePos(s.player.row, s.player.col, s.maze.size);
+  const cameraX = -(playerPixel.left + TILE_W / 2);
+  const cameraY = -(playerPixel.top + TILE_H / 2);
+  const trapGuardCharges = s.trapGuardCharges || 0;
+
+  return (
+    <div style={screen === "playing" ? styles.pagePlaying : styles.page} className={screen === "playing" ? "ml-page-playing" : undefined}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=EB+Garamond:wght@400;600&display=swap');
+        .ml-display { font-family: 'Cinzel', Georgia, serif; }
+        .ml-body { font-family: 'EB Garamond', Georgia, serif; }
+        @keyframes mlFlicker { 0%,100% { opacity: 0.65; } 50% { opacity: 1; } }
+        @keyframes mlShake { 0%,100% { transform: translateX(0); } 20% { transform: translateX(-8px); } 40% { transform: translateX(7px); } 60% { transform: translateX(-5px); } 80% { transform: translateX(4px); } }
+        @keyframes mlPopIn { 0% { transform: scale(0.7); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
+        @keyframes mlPulseDanger { 0%,100% { opacity: var(--danger-min); } 50% { opacity: var(--danger-max); } }
+        @keyframes mlStomp { 0%,100% { transform: translate(-50%,-50%) scale(1); } 50% { transform: translate(-50%,-50%) scale(1.12); } }
+        @keyframes mlChestGlow { 0%,100% { opacity: 0.6; } 50% { opacity: 1; } }
+        @keyframes mlFloatUp { 0% { transform: translate(-50%, 0); opacity: 1; } 100% { transform: translate(-50%, -30px); opacity: 0; } }
+        .ml-press { transition: transform 0.08s ease; }
+        .ml-press:active { transform: scale(0.94); }
+        .ml-scroll::-webkit-scrollbar { display: none; }
+        .ml-scroll { scrollbar-width: none; -ms-overflow-style: none; }
+        /* on the playing screen the whole page pins to exactly one viewport (dvh accounts for
+           mobile browser chrome) so the HUD and the maze are always visible together, never
+           requiring an outer page scroll - only the maze's own inner viewport scrolls */
+        .ml-page-playing { height: 100vh; height: 100dvh; overflow: hidden; }
+      `}</style>
+
+      {screen === "start" ? (
+        <div style={styles.startScreen}>
+          <div className="ml-display" style={styles.title}>🐂 미노타우르스의 미궁 3</div>
+          <div className="ml-body" style={styles.subtitle}>미궁 입구를 골라 도전하세요. 같은 이름의 입구는 언제나 완전히 같은 길이라 외운 대로 스피드런할 수 있어요. 20칸을 움직이면 미노타우르스가 깨어나 쫓아옵니다 — 함정 상자는 즉사예요!</div>
+
+          {!nicknameChecked ? (
+            <div className="ml-body" style={styles.startLabel}>불러오는 중...</div>
+          ) : !nickname || editingNickname ? (
+            <>
+              <div className="ml-body" style={styles.startLabel}>닉네임</div>
+              <input
+                value={nicknameDraft}
+                onChange={(e) => setNicknameDraft(e.target.value)}
+                placeholder="예) 방랑자"
+                maxLength={12}
+                style={styles.nickInput}
+              />
+            </>
+          ) : (
+            <div style={styles.nicknameRow}>
+              <span className="ml-body" style={styles.nicknameText}>👤 {nickname}님</span>
+              <button
+                onClick={() => {
+                  setNicknameDraft(nickname);
+                  setEditingNickname(true);
+                }}
+                className="ml-press"
+                style={styles.nicknameChangeBtn}
+              >
+                변경
+              </button>
+            </div>
+          )}
+
+          <div style={styles.walletRow}>
+            <div style={styles.walletGems}>💎 {walletChecked ? gems : "..."}</div>
+            <div style={styles.walletItem} title={ITEMS.stealth.desc}>{ITEMS.stealth.icon} {inventory.stealth}</div>
+            <div style={styles.walletItem} title={ITEMS.invincible.desc}>{ITEMS.invincible.icon} {inventory.invincible}</div>
+            <button onClick={() => setShopOpen((v) => !v)} className="ml-press" style={styles.shopToggleBtn}>
+              🛒 상점 {shopOpen ? "▲" : "▼"}
+            </button>
+          </div>
+
+          {shopOpen && (
+            <div style={styles.shopPanel}>
+              <div className="ml-body" style={styles.shopHint}>보석은 게임 중 보물상자에서 낮은 확률로 나와요. (실제 결제 연동은 앱 출시 단계에서 붙일 수 있어요)</div>
+              {Object.values(ITEMS).map((item) => (
+                <div key={item.id} style={styles.shopItemRow}>
+                  <div style={styles.shopItemInfo}>
+                    <span className="ml-display" style={styles.shopItemName}>{item.icon} {item.name}</span>
+                    <span className="ml-body" style={styles.shopItemDesc}>{item.desc}</span>
+                  </div>
+                  <button
+                    onClick={() => buyItem(item.id)}
+                    disabled={gems < item.shopCost}
+                    className="ml-press"
+                    style={styles.shopBuyBtn(gems >= item.shopCost)}
+                  >
+                    💎{item.shopCost}
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="ml-body" style={styles.startLabel}>입구 선택 — 같은 입구는 언제나 같은 길이에요</div>
+          <div className="ml-body" style={styles.routeSectionLabel}>일반 (목숨 5개 · 3회부터 다칠수록 미노타우르스가 빨라져요 · 보물상자에서 가끔 생명 회복)</div>
+          <div style={styles.routeGrid}>
+            {ROUTES.filter((r) => r.mode === "normal").map((r) => (
+              <button
+                key={r.id}
+                onClick={() => setPendingRouteId(r.id)}
+                className="ml-press"
+                style={styles.routeBtn(pendingRouteId === r.id, TIER_COLOR[r.tier])}
+              >
+                <span className="ml-display" style={styles.routeBtnName}>{r.name}</span>
+                <span className="ml-body" style={styles.routeBtnTier(TIER_COLOR[r.tier])}>{DIFFICULTIES[r.tier].label}</span>
+              </button>
+            ))}
+          </div>
+
+          <div className="ml-body" style={styles.routeSectionLabel}>⚡ 스피드런 (목숨 1개 · 미노타우르스 처음부터 0.3초로 전속력 — 같은 미로를 그대로 씀)</div>
+          <div style={styles.routeGrid}>
+            {ROUTES.filter((r) => r.mode === "speedrun").map((r) => (
+              <button
+                key={r.id}
+                onClick={() => setPendingRouteId(r.id)}
+                className="ml-press"
+                style={styles.routeBtnSpeedrun(pendingRouteId === r.id, TIER_COLOR[r.tier])}
+              >
+                <span className="ml-display" style={styles.routeBtnName}>⚡ {r.name}</span>
+                <span className="ml-body" style={styles.routeBtnTier(TIER_COLOR[r.tier])}>{DIFFICULTIES[r.tier].label} · 스피드런</span>
+              </button>
+            ))}
+          </div>
+
+          <button onClick={beginGame} className="ml-press" style={styles.startBtn}>게임 시작</button>
+        </div>
+      ) : (
+        <>
+      {/* compact single-row HUD: title + all stats + buttons together, so it never pushes
+          the maze below the fold - everything the player needs is visible at a glance */}
+      <div style={styles.hudCompact}>
+        <span className="ml-display" style={styles.hudTitle}>🐂 {s.route ? `${s.route.name}의 길` : nickname}</span>
+        <div style={styles.statBox}><Clock size={12} color="#e0b23c" /> <span className="ml-body">{fmtTime(elapsed)}</span></div>
+        <div style={styles.statBoxLife}><Heart size={12} color="#ff6a5a" fill="#ff6a5a" /> <span className="ml-body">{s.lives}/{s.maxLives}</span></div>
+        <div style={styles.statBoxGold}><Coins size={12} color="#1a1410" /> <span className="ml-body">{s.gold}</span></div>
+        <div style={styles.statBox}><Skull size={12} color="#d9555f" /> <span className="ml-body">{attempts}</span></div>
+        <div style={styles.statBoxBest}><Trophy size={12} color="#1a1410" /> <span className="ml-body">지하 {s.floor}층</span></div>
+        <button
+          onClick={() => useItem("stealth")}
+          disabled={inventory.stealth <= 0 || s.gameState !== "playing" || s.paused}
+          className="ml-press"
+          style={styles.itemBtn(inventory.stealth > 0, s.stealthMovesLeft > 0)}
+          title={ITEMS.stealth.desc}
+        >
+          {ITEMS.stealth.icon}{inventory.stealth}
+        </button>
+        <button
+          onClick={() => useItem("invincible")}
+          disabled={inventory.invincible <= 0 || s.gameState !== "playing" || s.paused}
+          className="ml-press"
+          style={styles.itemBtn(inventory.invincible > 0, trapGuardCharges > 0)}
+          title={ITEMS.invincible.desc}
+        >
+          {ITEMS.invincible.icon}{inventory.invincible}
+        </button>
+        <button onClick={toggleMute} className="ml-press" style={styles.muteBtn}>{muted ? <VolumeX size={13} /> : <Volume2 size={13} />}</button>
+        <button
+          onClick={togglePause}
+          disabled={s.gameState !== "playing"}
+          className="ml-press"
+          style={styles.muteBtn}
+          title={s.paused ? "계속하기" : "일시정지"}
+        >
+          {s.paused ? <Play size={13} /> : <Pause size={13} />}
+        </button>
+        <button onClick={backToDifficultySelect} className="ml-press" style={styles.muteBtn} title="입구 선택"><RotateCcw size={13} /></button>
+      </div>
+
+      <div style={styles.warnRow}>
+        {s.stealthMovesLeft > 0 ? (
+          <div className="ml-display" style={styles.stealthWarn}>🕶️ 은신 중 — {s.stealthMovesLeft}턴 남음</div>
+        ) : trapGuardCharges > 0 ? (
+          <div className="ml-display" style={styles.invincibleWarn}>🛡️ 수호 부적 — {trapGuardCharges}회 남음</div>
+        ) : (
+          <>
+            {s.gameState === "playing" && !s.minotaurActive && (
+              <div className="ml-body" style={styles.graceWarn}>
+                🐂 {MOVES_TO_ACTIVATE - s.moveCount}칸 더 움직이면 미노타우르스가 깨어나요...
+              </div>
+            )}
+            {s.minotaurActive && s.gameState === "playing" && (
+              <div className="ml-display" style={styles.chaseWarn}>⚠ 쫓기고 있어요! {minoDist}칸 뒤</div>
+            )}
+          </>
+        )}
+      </div>
+
+      <div
+        style={{ ...styles.boardWrapFlex, animation: s.gameState === "exploded" || s.gameState === "caught" ? "mlShake 0.5s ease" : "none" }}
+      >
+        {dangerOpacity > 0 && (
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              pointerEvents: "none",
+              zIndex: 5,
+              background: "radial-gradient(circle, transparent 40%, rgba(180,20,20,0.6) 100%)",
+              "--danger-min": dangerOpacity * 0.5,
+              "--danger-max": dangerOpacity,
+              animation: "mlPulseDanger 0.9s ease-in-out infinite",
+            }}
+          />
+        )}
+        {/* camera layer: player's tile center is always translated to exactly (50%,50%) of
+            the viewport above, so the player token itself never has to move on screen -
+            the maze slides underneath it instead. Transform is CSS-animated for a smooth pan. */}
+        <div
+          style={{
+            position: "absolute",
+            left: "50%",
+            top: "50%",
+            width: s.maze.size * TILE_W,
+            height: s.maze.size * TILE_H + TILE_H * 2,
+            transform: `translate(${cameraX}px, ${cameraY}px)`,
+            transition: "transform 0.13s linear",
+          }}
+        >
+          {s.maze.grid.map((rowArr, r) =>
+            rowArr.map((cellType, c) => {
+              if (cellType === "wall") return null;
+              const k = key(r, c);
+              if (!s.explored.has(k)) return null;
+              const isVisible = s.visible.has(k);
+              const { left, top } = tilePos(r, c, s.maze.size);
+              const isGoal = r === s.maze.goal.row && c === s.maze.goal.col;
+              const isStart = r === s.maze.start.row && c === s.maze.start.col;
+              const isPlayer = s.player.row === r && s.player.col === c;
+              const isMino = s.minotaurActive && s.minotaurTrailIdx >= 0 && s.minotaur.row === r && s.minotaur.col === c;
+              const isBox = s.maze.boxCells.has(k) && !s.takenBoxes.has(k) && !isPlayer;
+              const adjacent = s.gameState === "playing" && !(s.player.row === r && s.player.col === c);
+              return (
+                <div
+                  key={k}
+                  onClick={() => handleTileClick(r, c)}
+                  style={{ position: "absolute", left, top, width: TILE_W, height: TILE_H, zIndex: r + c, cursor: adjacent ? "pointer" : "default" }}
+                >
+                  <div
+                    style={{
+                      position: "absolute",
+                      inset: 0,
+                      background: "linear-gradient(160deg,#3f3527,#241d15)",
+                      border: "1px solid #55452e",
+                      clipPath: "polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%)",
+                      boxShadow: isVisible ? "inset 0 0 12px rgba(255,180,90,0.22)" : "none",
+                    }}
+                  />
+                  {isGoal && (
+                    <div style={{ position: "absolute", left: TILE_W / 2, top: TILE_H / 2, transform: "translate(-50%,-50%)", fontSize: 21, animation: isVisible ? "mlFlicker 1.4s infinite" : "none" }}>🚪</div>
+                  )}
+                  {isBox && (
+                    <Package size={22} color="#c2672c" style={{ position: "absolute", left: TILE_W / 2, top: TILE_H / 2, transform: "translate(-50%,-50%)", animation: isVisible ? "mlChestGlow 1.8s infinite" : "none" }} />
+                  )}
+                  {isStart && !isPlayer && (
+                    <div style={{ position: "absolute", left: TILE_W / 2, top: TILE_H / 2, transform: "translate(-50%,-50%)", fontSize: 17, opacity: 0.5 }}>🚩</div>
+                  )}
+                  {isMino && (
+                    <div style={{ position: "absolute", left: TILE_W / 2, top: TILE_H / 2, transform: "translate(-50%,-50%)", zIndex: 90, fontSize: 28, animation: "mlStomp 0.35s ease-in-out infinite", filter: "drop-shadow(0 0 6px #ff3a3a)" }}>
+                      🐂
+                    </div>
+                  )}
+                  {isPlayer && (
+                    <div ref={playerTokenRef} style={{ position: "absolute", left: TILE_W / 2, top: TILE_H / 2, transform: "translate(-50%,-50%)", zIndex: 80, fontSize: 24 }}>🧍</div>
+                  )}
+                </div>
+              );
+            })
+          )}
+
+          {s.floaters.map((f) => (
+            <div
+              key={f.id}
+              className="ml-display"
+              style={{
+                position: "absolute",
+                left: f.left,
+                top: f.top - 14,
+                color: f.color,
+                fontSize: 13,
+                fontWeight: 700,
+                textShadow: "0 1px 3px #000",
+                animation: "mlFloatUp 0.8s ease-out forwards",
+                zIndex: 999,
+                pointerEvents: "none",
+              }}
+            >
+              {f.text}
+            </div>
+          ))}
+        </div>
+
+        {overlayShown && (
+          <div style={{ position: "absolute", inset: 0, background: "rgba(20,4,4,0.55)", zIndex: 199, pointerEvents: "auto" }} />
+        )}
+
+        {(s.gameState === "exploded" || s.gameState === "caught") && (
+          <div style={styles.deathOverlayCard("50%", "50%")}>
+            <div style={{ fontSize: 40 }}>{s.gameState === "exploded" ? "💥" : "🐂"}</div>
+            <div className="ml-display" style={styles.deathText}>{s.gameState === "exploded" ? "쾅!" : "붙잡혔다!"}</div>
+            <div className="ml-body" style={styles.deathSub}>
+              {difficulty === "hard"
+                ? "1층부터 다시 시작합니다... 골드도 초기화돼요."
+                : s.revivesUsed >= REVIVE_LIMIT
+                ? "부활 횟수를 모두 사용해서 1층부터 다시 시작합니다... 골드도 초기화돼요."
+                : `이 층의 시작점에서 부활합니다... 길은 그대로예요. (부활 ${REVIVE_LIMIT - s.revivesUsed}/${REVIVE_LIMIT}회 남음)`}
+            </div>
+            <div style={styles.deathBtnRow}>
+              <button onClick={resetAttempt} className="ml-press" style={styles.deathBtnPrimary}>
+                <RotateCcw size={13} style={{ marginRight: 5, position: "relative", top: 2 }} />
+                {difficulty === "hard"
+                  ? "부활"
+                  : s.revivesUsed >= REVIVE_LIMIT
+                  ? "부활 (1층부터)"
+                  : `부활 (${REVIVE_LIMIT - s.revivesUsed}/${REVIVE_LIMIT})`}
+              </button>
+              <button onClick={backToDifficultySelect} className="ml-press" style={styles.deathBtnGhost}>입구 선택</button>
+            </div>
+          </div>
+        )}
+
+        {s.gameState === "playing" && s.paused && (
+          <div style={styles.deathOverlayCard("50%", "50%")}>
+            <div style={{ fontSize: 36 }}>⏸️</div>
+            <div className="ml-display" style={styles.deathText}>일시정지</div>
+            <div className="ml-body" style={styles.deathSub}>미노타우르스도, 타이머도 멈췄어요.</div>
+            <div style={styles.deathBtnRow}>
+              <button onClick={togglePause} className="ml-press" style={styles.deathBtnPrimary}>
+                <Play size={13} style={{ marginRight: 5, position: "relative", top: 2 }} />계속하기
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ---------- styles ---------- */
+const styles = {
+  page: { minHeight: "100vh", background: "radial-gradient(ellipse at 50% 0%, #241a10 0%, #0a0705 70%)", color: "#e8dcc0", display: "flex", flexDirection: "column", alignItems: "center", padding: "18px 12px 30px" },
+  // playing screen pins to exactly one viewport (no outer scroll) so the HUD stays
+  // permanently visible above the maze instead of being scrolled off-screen
+  pagePlaying: {
+    background: "radial-gradient(ellipse at 50% 0%, #241a10 0%, #0a0705 70%)",
+    color: "#e8dcc0",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    padding: "8px 8px",
+    boxSizing: "border-box",
+    width: "100%",
+  },
+  title: { fontSize: 22, color: "#e0b23c", letterSpacing: 0.5, textAlign: "center" },
+  subtitle: { fontSize: 12, color: "#a89a82", marginTop: 4, marginBottom: 12, textAlign: "center", maxWidth: 300 },
+  diffRow: { display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap", justifyContent: "center" },
+  diffBtn: (active) => ({ background: active ? "#5c3a1f" : "#1a140d", border: `2px solid ${active ? "#e0b23c" : "#4a3a26"}`, color: active ? "#ffe9b8" : "#a89a82", borderRadius: 14, padding: "6px 14px", fontSize: 12, fontWeight: 700, cursor: "pointer" }),
+  routeGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, width: "100%", marginBottom: 8 },
+  routeSectionLabel: { fontSize: 11, color: "#8a7a5e", alignSelf: "flex-start", marginTop: 4, marginBottom: 6 },
+  routeBtn: (active, tierColor) => ({
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: 3,
+    background: active ? "#5c3a1f" : "#1a140d",
+    border: `2px solid ${active ? "#e0b23c" : "#4a3a26"}`,
+    borderRadius: 12,
+    padding: "9px 6px",
+    cursor: "pointer",
+    boxShadow: active ? `0 0 10px ${tierColor}55` : "none",
+  }),
+  routeBtnSpeedrun: (active, tierColor) => ({
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: 3,
+    background: active ? "#6b1f22" : "#1a0d0d",
+    border: `2px solid ${active ? "#ff6a5a" : "#4a2a26"}`,
+    borderRadius: 12,
+    padding: "9px 6px",
+    cursor: "pointer",
+    boxShadow: active ? `0 0 10px ${tierColor}55` : "none",
+  }),
+  routeBtnName: { fontSize: 13, color: "#ffe9b8", fontWeight: 700 },
+  routeBtnTier: (tierColor) => ({ fontSize: 10.5, color: tierColor, fontWeight: 700 }),
+  // compact all-in-one HUD row (title + every stat + buttons) so nothing is pushed
+  // off the visible screen - this is the only header shown while playing
+  hudCompact: {
+    display: "flex",
+    gap: 6,
+    marginBottom: 4,
+    flexWrap: "wrap",
+    justifyContent: "center",
+    alignItems: "center",
+    background: "#150f0a",
+    border: "2px solid #4a3a26",
+    borderRadius: 14,
+    padding: "6px 10px",
+    boxShadow: "0 3px 10px rgba(0,0,0,0.4)",
+    width: "100%",
+    maxWidth: 560,
+    boxSizing: "border-box",
+    flexShrink: 0,
+  },
+  hudTitle: { fontSize: 13, color: "#e0b23c", fontWeight: 700, marginRight: 2 },
+  statBox: { display: "flex", alignItems: "center", gap: 5, background: "#1a140d", border: "1px solid #5c4a32", borderRadius: 11, padding: "5px 10px", fontSize: 13, fontWeight: 700 },
+  statBoxLife: { display: "flex", alignItems: "center", gap: 5, background: "#2a1414", border: "1px solid #6b3a3a", color: "#ffb8a8", borderRadius: 11, padding: "5px 10px", fontSize: 13, fontWeight: 700 },
+  statBoxGold: { display: "flex", alignItems: "center", gap: 5, background: "linear-gradient(180deg,#f2d68a,#e0b23c)", color: "#1a1410", borderRadius: 11, padding: "5px 10px", fontSize: 13, fontWeight: 800 },
+  statBoxBest: { display: "flex", alignItems: "center", gap: 5, background: "linear-gradient(180deg,#f2d68a,#e0b23c)", color: "#1a1410", borderRadius: 11, padding: "5px 10px", fontSize: 13, fontWeight: 800 },
+  muteBtn: { display: "flex", alignItems: "center", justifyContent: "center", background: "#1a140d", border: "1px solid #5c4a32", color: "#e0d4b4", borderRadius: "50%", width: 30, height: 30, cursor: "pointer", flexShrink: 0 },
+  itemBtn: (owned, active) => ({
+    display: "flex",
+    alignItems: "center",
+    gap: 3,
+    background: active ? "linear-gradient(180deg,#e0b6ff,#9d6fe0)" : owned ? "#2a1e14" : "#171310",
+    border: `1px solid ${active ? "#e0b6ff" : owned ? "#6b5636" : "#3a3226"}`,
+    color: owned ? "#ffe9b8" : "#5a4e3a",
+    borderRadius: 11,
+    padding: "5px 9px",
+    fontSize: 13,
+    fontWeight: 700,
+    cursor: owned ? "pointer" : "default",
+    opacity: owned ? 1 : 0.5,
+    boxShadow: active ? "0 0 10px #c98bff88" : "none",
+    flexShrink: 0,
+  }),
+  // fixed-height reserved row so the grace/chase warning swap never reflows the board below it
+  warnRow: { minHeight: 18, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 },
+  graceWarn: { fontSize: 11.5, color: "#c9b696" },
+  chaseWarn: { fontSize: 13, color: "#ff6a5a", fontWeight: 700 },
+  stealthWarn: { fontSize: 13, color: "#c9b6ff", fontWeight: 700 },
+  invincibleWarn: { fontSize: 13, color: "#ffe37f", fontWeight: 700 },
+  boardWrap: { position: "relative", width: "100%", maxWidth: 560, overflow: "auto", background: "repeating-linear-gradient(45deg, #0a0705 0px, #0a0705 2px, #070504 2px, #070504 4px)", border: "3px solid #4a3a26", borderRadius: 14, boxShadow: "inset 0 0 60px rgba(0,0,0,0.5)", maxHeight: 460 },
+  // fills all remaining vertical space in the flex column instead of a fixed maxHeight,
+  // so the maze always occupies exactly what's left after the HUD - never more, never less.
+  // overflow:hidden (not auto) because the player never scrolls anymore - the camera layer
+  // inside pans itself so the player token stays fixed at the exact center of this box.
+  boardWrapFlex: {
+    position: "relative",
+    width: "100%",
+    maxWidth: 560,
+    overflow: "hidden",
+    background: "repeating-linear-gradient(45deg, #0a0705 0px, #0a0705 2px, #070504 2px, #070504 4px)",
+    border: "3px solid #4a3a26",
+    borderRadius: 14,
+    boxShadow: "inset 0 0 60px rgba(0,0,0,0.5)",
+    flex: 1,
+    minHeight: 0,
+  },
+  // card pinned to dead-center of the viewport box - the camera guarantees the player is
+  // always there, so the overlay no longer needs a maze-coordinate pixel position at all
+  deathOverlayCard: (x, y) => ({
+    position: "absolute",
+    left: x,
+    top: y,
+    transform: "translate(-50%, -50%)",
+    zIndex: 200,
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    background: "linear-gradient(180deg,#1a1410,#100c09)",
+    border: "2px solid #4a3a26",
+    borderRadius: 16,
+    padding: "20px 18px",
+    boxShadow: "0 8px 30px rgba(0,0,0,0.6)",
+    width: 220,
+    animation: "mlPopIn 0.2s ease",
+  }),
+  deathText: { fontSize: 24, color: "#ff8a6a" },
+  deathSub: { fontSize: 12, color: "#e8c9b8", textAlign: "center", maxWidth: 240, marginBottom: 4 },
+  deathBtnRow: { display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap", justifyContent: "center" },
+  deathBtnPrimary: { display: "flex", alignItems: "center", background: "#5c3a1f", border: "2px solid #e0b23c", color: "#ffe9b8", borderRadius: 12, padding: "9px 16px", fontSize: 13, fontWeight: 700, cursor: "pointer" },
+  deathBtnGhost: { background: "transparent", border: "2px solid #6b5636", color: "#c9b696", borderRadius: 12, padding: "9px 16px", fontSize: 13, fontWeight: 700, cursor: "pointer" },
+  startScreen: { display: "flex", flexDirection: "column", alignItems: "center", width: "100%", maxWidth: 340, marginTop: 40 },
+  startLabel: { fontSize: 12, color: "#c9b696", alignSelf: "flex-start", marginTop: 18, marginBottom: 6 },
+  nickInput: { width: "100%", boxSizing: "border-box", background: "#1a140d", border: "2px solid #4a3a26", borderRadius: 12, padding: "10px 14px", fontSize: 14, color: "#e8dcc0", outline: "none" },
+  nicknameRow: { width: "100%", boxSizing: "border-box", display: "flex", alignItems: "center", justifyContent: "space-between", background: "#1a140d", border: "2px solid #4a3a26", borderRadius: 12, padding: "10px 14px" },
+  nicknameText: { fontSize: 14, color: "#e8dcc0", fontWeight: 700 },
+  nicknameChangeBtn: { background: "transparent", border: "1px solid #6b5636", color: "#c9b696", borderRadius: 10, padding: "5px 11px", fontSize: 11.5, cursor: "pointer" },
+  walletRow: { display: "flex", alignItems: "center", gap: 6, width: "100%", marginTop: 14, flexWrap: "wrap" },
+  walletGems: { display: "flex", alignItems: "center", gap: 4, background: "#14202a", border: "1px solid #2c4a5a", color: "#8fd7ff", borderRadius: 11, padding: "5px 10px", fontSize: 13, fontWeight: 700 },
+  walletItem: { display: "flex", alignItems: "center", gap: 4, background: "#1a140d", border: "1px solid #5c4a32", color: "#e0d4b4", borderRadius: 11, padding: "5px 10px", fontSize: 13, fontWeight: 700 },
+  shopToggleBtn: { marginLeft: "auto", background: "#1a140d", border: "1px solid #5c4a32", color: "#e0d4b4", borderRadius: 11, padding: "6px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer" },
+  shopPanel: { width: "100%", background: "#150f0a", border: "2px solid #4a3a26", borderRadius: 12, padding: "10px 12px", marginTop: 8, boxSizing: "border-box" },
+  shopHint: { fontSize: 10.5, color: "#8a7a5e", marginBottom: 8 },
+  shopItemRow: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "7px 0", borderTop: "1px solid #2a2016" },
+  shopItemInfo: { display: "flex", flexDirection: "column", gap: 2 },
+  shopItemName: { fontSize: 13, color: "#ffe9b8", fontWeight: 700 },
+  shopItemDesc: { fontSize: 10.5, color: "#a89a82", maxWidth: 190 },
+  shopBuyBtn: (affordable) => ({
+    background: affordable ? "linear-gradient(180deg,#8fd7ff,#4a9fd0)" : "#241d15",
+    border: `1px solid ${affordable ? "#c8ecff" : "#4a3a26"}`,
+    color: affordable ? "#0a1a20" : "#5a4e3a",
+    borderRadius: 10,
+    padding: "7px 12px",
+    fontSize: 12.5,
+    fontWeight: 800,
+    cursor: affordable ? "pointer" : "default",
+    flexShrink: 0,
+  }),
+  startBtn: { marginTop: 26, background: "linear-gradient(180deg,#f2d68a,#e0b23c)", border: "2px solid #b47828", color: "#1a1410", borderRadius: 14, padding: "12px 36px", fontSize: 15, fontWeight: 800, cursor: "pointer", fontFamily: "'Cinzel', Georgia, serif" },
+  hint: { fontSize: 11.5, color: "#8a7a5e", marginTop: 12, textAlign: "center", maxWidth: 320 },
+  overlay: { position: "fixed", inset: 0, background: "rgba(6,4,3,0.82)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 },
+  overlayCard: { background: "linear-gradient(180deg,#1a1410,#100c09)", border: "1px solid #4a3a26", borderRadius: 12, padding: "28px 32px", textAlign: "center", animation: "mlPopIn 0.25s ease", maxWidth: 320 },
+  overlayBtn: { background: "#5c3a1f", border: "2px solid #e0b23c", color: "#ffe9b8", borderRadius: 12, padding: "9px 18px", fontSize: 13, fontWeight: 700, cursor: "pointer", fontFamily: "'Cinzel', Georgia, serif" },
+  overlayBtnGhost: { display: "flex", alignItems: "center", background: "transparent", border: "2px solid #4a3a26", color: "#a89a82", borderRadius: 12, padding: "9px 16px", fontSize: 12.5, cursor: "pointer" },
+};
+
+const rootEl = document.getElementById("root");
+ReactDOM.createRoot(rootEl).render(<MinotaurLabyrinth />);
+
+</script>
+</body>
+</html>
